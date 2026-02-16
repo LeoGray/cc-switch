@@ -10,12 +10,15 @@ use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
 use reqwest::RequestBuilder;
+use serde_json::Value;
 use std::sync::LazyLock;
 
 /// 官方 Codex 客户端 User-Agent 正则
 #[allow(dead_code)]
 static CODEX_CLIENT_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(codex_vscode|codex_cli_rs)/[\d.]+").unwrap());
+
+const OPENAI_OFFICIAL_BASE_URL: &str = "https://api.openai.com";
 
 /// Codex 适配器
 pub struct CodexAdapter;
@@ -33,40 +36,129 @@ impl CodexAdapter {
         CODEX_CLIENT_REGEX.is_match(user_agent)
     }
 
+    /// 判断是否为 OpenAI 官方供应商
+    fn is_official_provider(provider: &Provider) -> bool {
+        provider
+            .category
+            .as_deref()
+            .map(|c| c.eq_ignore_ascii_case("official"))
+            .unwrap_or(false)
+            || provider.name.eq_ignore_ascii_case("OpenAI Official")
+    }
+
+    /// 归一化字符串：去除首尾空白，空字符串视为 None
+    fn normalize_non_empty(raw: Option<&str>) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+    }
+
+    /// 从 auth JSON 值中提取 OpenAI Token（兼容多字段）
+    fn extract_token_from_auth_value(auth: &Value) -> Option<String> {
+        if let Some(s) = auth.as_str() {
+            return Self::normalize_non_empty(Some(s));
+        }
+
+        // 优先级：API Key 字段 > access token 字段
+        for field in [
+            "OPENAI_API_KEY",
+            "OPENAI_ACCESS_TOKEN",
+            "api_key",
+            "apiKey",
+            "access_token",
+            "accessToken",
+        ] {
+            if let Some(token) = Self::normalize_non_empty(auth.get(field).and_then(|v| v.as_str()))
+            {
+                return Some(token);
+            }
+        }
+
+        None
+    }
+
+    /// 从本机 Codex live auth.json 中提取 Token（用于 official 供应商兜底）
+    fn extract_live_key(&self) -> Option<String> {
+        let auth_path = crate::codex_config::get_codex_auth_path();
+        let content = std::fs::read_to_string(auth_path).ok()?;
+        let auth_json: Value = serde_json::from_str(&content).ok()?;
+        Self::extract_token_from_auth_value(&auth_json)
+    }
+
+    /// 从 TOML 文本中提取 base_url
+    fn extract_base_url_from_toml(config_str: &str) -> Option<String> {
+        if let Some(start) = config_str.find("base_url = \"") {
+            let rest = &config_str[start + 12..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].trim_end_matches('/').to_string());
+            }
+        }
+        if let Some(start) = config_str.find("base_url = '") {
+            let rest = &config_str[start + 12..];
+            if let Some(end) = rest.find('\'') {
+                return Some(rest[..end].trim_end_matches('/').to_string());
+            }
+        }
+        None
+    }
+
     /// 从 Provider 配置中提取 API Key
     fn extract_key(&self, provider: &Provider) -> Option<String> {
         // 1. 尝试从 env 中获取
         if let Some(env) = provider.settings_config.get("env") {
-            if let Some(key) = env.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
-                return Some(key.to_string());
+            if let Some(key) =
+                Self::normalize_non_empty(env.get("OPENAI_API_KEY").and_then(|v| v.as_str()))
+            {
+                return Some(key);
+            }
+            if let Some(token) =
+                Self::normalize_non_empty(env.get("OPENAI_ACCESS_TOKEN").and_then(|v| v.as_str()))
+            {
+                return Some(token);
             }
         }
 
         // 2. 尝试从 auth 中获取 (Codex CLI 格式)
         if let Some(auth) = provider.settings_config.get("auth") {
-            if let Some(key) = auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
-                return Some(key.to_string());
+            if let Some(token) = Self::extract_token_from_auth_value(auth) {
+                return Some(token);
             }
         }
 
         // 3. 尝试直接获取
-        if let Some(key) = provider
-            .settings_config
-            .get("apiKey")
-            .or_else(|| provider.settings_config.get("api_key"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(key.to_string());
+        if let Some(key) = Self::normalize_non_empty(
+            provider
+                .settings_config
+                .get("apiKey")
+                .or_else(|| provider.settings_config.get("api_key"))
+                .and_then(|v| v.as_str()),
+        ) {
+            return Some(key);
         }
 
-        // 4. 尝试从 config 对象中获取
+        // 4. 兼容 access_token 字段
+        if let Some(token) = Self::normalize_non_empty(
+            provider
+                .settings_config
+                .get("access_token")
+                .or_else(|| provider.settings_config.get("accessToken"))
+                .and_then(|v| v.as_str()),
+        ) {
+            return Some(token);
+        }
+
+        // 5. 尝试从 config 对象中获取
         if let Some(config) = provider.settings_config.get("config") {
-            if let Some(key) = config
-                .get("api_key")
-                .or_else(|| config.get("apiKey"))
-                .and_then(|v| v.as_str())
-            {
-                return Some(key.to_string());
+            if let Some(key) = Self::normalize_non_empty(
+                config
+                    .get("api_key")
+                    .or_else(|| config.get("apiKey"))
+                    .or_else(|| config.get("OPENAI_API_KEY"))
+                    .or_else(|| config.get("access_token"))
+                    .or_else(|| config.get("accessToken"))
+                    .and_then(|v| v.as_str()),
+            ) {
+                return Some(key);
             }
         }
 
@@ -87,44 +179,44 @@ impl ProviderAdapter for CodexAdapter {
 
     fn extract_base_url(&self, provider: &Provider) -> Result<String, ProxyError> {
         // 1. 尝试直接获取 base_url 字段
-        if let Some(url) = provider
-            .settings_config
-            .get("base_url")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(url) = Self::normalize_non_empty(
+            provider
+                .settings_config
+                .get("base_url")
+                .and_then(|v| v.as_str()),
+        ) {
             return Ok(url.trim_end_matches('/').to_string());
         }
 
         // 2. 尝试 baseURL
-        if let Some(url) = provider
-            .settings_config
-            .get("baseURL")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(url) = Self::normalize_non_empty(
+            provider
+                .settings_config
+                .get("baseURL")
+                .and_then(|v| v.as_str()),
+        ) {
             return Ok(url.trim_end_matches('/').to_string());
         }
 
         // 3. 尝试从 config 对象中获取
         if let Some(config) = provider.settings_config.get("config") {
-            if let Some(url) = config.get("base_url").and_then(|v| v.as_str()) {
+            if let Some(url) =
+                Self::normalize_non_empty(config.get("base_url").and_then(|v| v.as_str()))
+            {
                 return Ok(url.trim_end_matches('/').to_string());
             }
 
             // 尝试解析 TOML 字符串格式
             if let Some(config_str) = config.as_str() {
-                if let Some(start) = config_str.find("base_url = \"") {
-                    let rest = &config_str[start + 12..];
-                    if let Some(end) = rest.find('"') {
-                        return Ok(rest[..end].trim_end_matches('/').to_string());
-                    }
-                }
-                if let Some(start) = config_str.find("base_url = '") {
-                    let rest = &config_str[start + 12..];
-                    if let Some(end) = rest.find('\'') {
-                        return Ok(rest[..end].trim_end_matches('/').to_string());
-                    }
+                if let Some(url) = Self::extract_base_url_from_toml(config_str) {
+                    return Ok(url);
                 }
             }
+        }
+
+        // OpenAI Official 允许省略 base_url（默认官方端点）
+        if Self::is_official_provider(provider) {
+            return Ok(OPENAI_OFFICIAL_BASE_URL.to_string());
         }
 
         Err(ProxyError::ConfigError(
@@ -133,8 +225,18 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo> {
-        self.extract_key(provider)
-            .map(|key| AuthInfo::new(key, AuthStrategy::Bearer))
+        if let Some(key) = self.extract_key(provider) {
+            return Some(AuthInfo::new(key, AuthStrategy::Bearer));
+        }
+
+        // OpenAI Official 预设通常不在 provider 中保存 token，回退到 ~/.codex/auth.json
+        if Self::is_official_provider(provider) {
+            return self
+                .extract_live_key()
+                .map(|key| AuthInfo::new(key, AuthStrategy::Bearer));
+        }
+
+        None
     }
 
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {
@@ -185,12 +287,19 @@ mod tests {
     use serde_json::json;
 
     fn create_provider(config: serde_json::Value) -> Provider {
+        create_provider_with_category(config, Some("codex"))
+    }
+
+    fn create_provider_with_category(
+        config: serde_json::Value,
+        category: Option<&str>,
+    ) -> Provider {
         Provider {
             id: "test".to_string(),
             name: "Test Codex".to_string(),
             settings_config: config,
             website_url: None,
-            category: Some("codex".to_string()),
+            category: category.map(|c| c.to_string()),
             created_at: None,
             sort_index: None,
             notes: None,
@@ -210,6 +319,24 @@ mod tests {
 
         let url = adapter.extract_base_url(&provider).unwrap();
         assert_eq!(url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_extract_base_url_official_uses_default() {
+        let adapter = CodexAdapter::new();
+        let provider = create_provider_with_category(json!({}), Some("official"));
+
+        let url = adapter.extract_base_url(&provider).unwrap();
+        assert_eq!(url, "https://api.openai.com");
+    }
+
+    #[test]
+    fn test_extract_base_url_missing_non_official_should_fail() {
+        let adapter = CodexAdapter::new();
+        let provider = create_provider_with_category(json!({}), Some("third_party"));
+
+        let err = adapter.extract_base_url(&provider).unwrap_err();
+        assert!(err.to_string().contains("缺少 base_url"));
     }
 
     #[test]
@@ -237,6 +364,19 @@ mod tests {
 
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.api_key, "sk-env-key-12345678");
+    }
+
+    #[test]
+    fn test_extract_auth_from_auth_access_token_field() {
+        let adapter = CodexAdapter::new();
+        let provider = create_provider(json!({
+            "auth": {
+                "access_token": "token-from-auth"
+            }
+        }));
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.api_key, "token-from-auth");
     }
 
     #[test]

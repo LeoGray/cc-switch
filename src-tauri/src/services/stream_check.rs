@@ -186,9 +186,23 @@ impl StreamCheckService {
             .extract_base_url(provider)
             .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}")))?;
 
-        let auth = adapter
-            .extract_auth(provider)
-            .ok_or_else(|| AppError::Message("API Key not found".to_string()))?;
+        let auth = adapter.extract_auth(provider).ok_or_else(|| {
+            let is_codex_official = matches!(app_type, AppType::Codex)
+                && provider
+                    .category
+                    .as_deref()
+                    .map(|c| c.eq_ignore_ascii_case("official"))
+                    .unwrap_or(false);
+
+            if is_codex_official {
+                AppError::Message(
+                    "Official Codex 未找到可用认证，请先在 Codex CLI 完成登录或检查 ~/.codex/auth.json"
+                        .to_string(),
+                )
+            } else {
+                AppError::Message("API Key not found".to_string())
+            }
+        })?;
 
         // 获取 HTTP 客户端：优先使用供应商单独代理配置，否则使用全局客户端
         let proxy_config = provider.meta.as_ref().and_then(|m| m.proxy_config.as_ref());
